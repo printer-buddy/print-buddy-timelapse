@@ -16,6 +16,7 @@ MODES = ("layer", "interval")
 INTERVALS = (5, 10, 30)
 FPS = (15, 25, 30)
 KEEPS = (5, 10, 20, 50, 100)
+SETTLE = 2  # seconds a layer worked out from Z must hold before it counts
 
 
 def enabled() -> bool:
@@ -51,9 +52,26 @@ class Timelapse:
             self._finish(pid, v["state"])
         elif job and job["mode"] == "layer" and v["state"] == "printing":
             layer = v.get("layer")
-            if layer is not None and layer != job["layer"]:
+            if layer is None:
+                return
+            if v.get("layer_from_z"):
+                # layer worked out from the nozzle height: a Z-hop lifts it for a moment, so only count a higher
+                # layer that holds for SETTLE seconds (the lowest value seen in that time, since hops only go up)
+                if job["settle"]:
+                    job["low"] = min(job["low"], layer)
+                elif job["layer"] is None or layer > job["layer"]:
+                    job["low"] = layer
+                    job["settle"] = asyncio.get_running_loop().create_task(self._settle(pid, job))
+            elif layer != job["layer"]:
                 job["layer"] = layer
                 asyncio.get_running_loop().create_task(self._capture(pid))
+
+    async def _settle(self, pid: int, job: dict):
+        await asyncio.sleep(SETTLE)
+        job["settle"] = None
+        if self.active.get(pid) is job and (job["layer"] is None or job["low"] > job["layer"]):
+            job["layer"] = job["low"]
+            await self._capture(pid)
 
     def _start(self, pid: int, v: dict):
         if pid in self.skip:
@@ -63,7 +81,8 @@ class Timelapse:
         tid = str(int(time.time()))
         frames_dir = self.root / str(pid) / f"{tid}.frames"
         frames_dir.mkdir(parents=True, exist_ok=True)
-        job = {"id": tid, "dir": frames_dir, "frames": 0, "layer": v.get("layer"), "mode": cfg["tl_mode"],
+        job = {"id": tid, "dir": frames_dir, "frames": 0, "layer": None if v.get("layer_from_z") else v.get("layer"),
+               "low": None, "settle": None, "mode": cfg["tl_mode"],
                "fps": cfg["tl_fps"], "file": v.get("filename"), "printer": v.get("name"), "started": time.time(),
                "state": "printing", "task": None}
         self.active[pid] = job
